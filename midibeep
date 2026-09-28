@@ -1,0 +1,897 @@
+#!/usr/bin/env python3
+"""midibeep - turn (almost) any MIDI file into a single-voice beep sequence.
+
+The PC speaker can play one tone at a time, so a multi-channel, chordal MIDI
+file has to be "projected" onto one line. This tool:
+
+  1. parses the MIDI file itself (format 0/1/2, tempo map, running status),
+  2. rates every voice (track+channel) on how melody-like it is
+     (register, monophony, instrument, track name, activity),
+  3. runs a Viterbi search over the timeline that picks at every moment the
+     single most important sounding note: melody voices first, highest note
+     as a tie-breaker, with penalties for chopping notes and jumping around,
+  4. lets accompaniment fill only the gaps where the melody is silent
+     (optionally as fast arpeggios that imitate chords),
+  5. emits a `beep` command line, plays it, saves a script or renders a WAV.
+
+Run `midibeep --info song.mid` to see how voices were rated and override
+with --melody / --mute if the guess is wrong.
+"""
+
+import argparse
+import bisect
+import math
+import os
+import re
+import shlex
+import struct
+import subprocess
+import sys
+import wave
+from array import array
+
+DRUM_CHANNEL = 9
+NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+GM_FAMILIES = [
+    'Piano', 'Chrom.Perc', 'Organ', 'Guitar', 'Bass', 'Strings', 'Ensemble',
+    'Brass', 'Reed', 'Pipe', 'Synth Lead', 'Synth Pad', 'Synth FX', 'Ethnic',
+    'Percussive', 'SFX',
+]
+# How melody-like each GM family (program // 8) tends to be.
+FAMILY_BONUS = [
+    0.00, 0.02, -0.02, 0.00, -0.45, -0.05, -0.12,
+    0.06, 0.08, 0.08, 0.12, -0.20, -0.15, 0.00,
+    -0.30, -0.40,
+]
+NAME_PLUS = re.compile(r'melod|lead|vocal|voice|solo|main|theme|sing|right|\brh\b|mel\b|flute|violin', re.I)
+NAME_MINUS = re.compile(r'bass|drum|perc|pad|chord|accomp|harm|backing|\bbg\b|rhythm|left|\blh\b|kick|snare|hat|strings?\b|arp', re.I)
+
+
+def note_name(p):
+    return f'{NOTE_NAMES[p % 12]}{p // 12 - 1}'
+
+
+def midi_to_hz(p):
+    return 440.0 * 2 ** ((p - 69) / 12)
+
+
+# --------------------------------------------------------------------------
+# MIDI parsing
+# --------------------------------------------------------------------------
+
+class Note:
+    __slots__ = ('start', 'end', 'pitch', 'vel', 'voice', 'prog', 'idx', 'w')
+
+    def __init__(self, start, end, pitch, vel, voice, prog):
+        self.start, self.end, self.pitch = start, end, pitch
+        self.vel, self.voice, self.prog = vel, voice, prog
+        self.idx = -1
+        self.w = 0.0  # melodic importance 0..1, set by local_weights()
+
+
+def read_vlq(data, pos):
+    value = 0
+    while pos < len(data):
+        b = data[pos]
+        pos += 1
+        value = (value << 7) | (b & 0x7F)
+        if not b & 0x80:
+            break
+    return value, pos
+
+
+def parse_track(data):
+    """Yield (tick, kind, a, b, c) events from one MTrk chunk."""
+    events = []
+    pos, tick, status = 0, 0, None
+    n = len(data)
+    while pos < n:
+        delta, pos = read_vlq(data, pos)
+        tick += delta
+        if pos >= n:
+            break
+        b = data[pos]
+        if b == 0xFF:  # meta
+            if pos + 1 >= n:
+                break
+            mtype = data[pos + 1]
+            length, pos = read_vlq(data, pos + 2)
+            payload = data[pos:pos + length]
+            pos += length
+            if mtype == 0x51 and len(payload) == 3:
+                events.append((tick, 'tempo', int.from_bytes(payload, 'big'), 0, 0))
+            elif mtype in (0x03, 0x04):
+                events.append((tick, 'name', payload.decode('latin-1', 'replace').strip(), 0, 0))
+            elif mtype == 0x2F:
+                events.append((tick, 'end', 0, 0, 0))
+                break
+            continue
+        if b in (0xF0, 0xF7):  # sysex
+            length, pos = read_vlq(data, pos + 1)
+            pos += length
+            continue
+        if b & 0x80:
+            status = b
+            pos += 1
+        elif status is None:  # garbage without running status; skip byte
+            pos += 1
+            continue
+        kind, ch = status & 0xF0, status & 0x0F
+        nbytes = 1 if kind in (0xC0, 0xD0) else 2
+        if pos + nbytes > n:
+            break
+        d1 = data[pos]
+        d2 = data[pos + 1] if nbytes == 2 else 0
+        pos += nbytes
+        if kind == 0x90 and d2 > 0:
+            events.append((tick, 'on', ch, d1, d2))
+        elif kind == 0x80 or (kind == 0x90 and d2 == 0):
+            events.append((tick, 'off', ch, d1, 0))
+        elif kind == 0xC0:
+            events.append((tick, 'prog', ch, d1, 0))
+    if not events or events[-1][1] != 'end':
+        events.append((tick, 'end', 0, 0, 0))
+    return events
+
+
+def load_midi(path):
+    with open(path, 'rb') as f:
+        data = f.read()
+    start = data.find(b'MThd')  # also handles RIFF/RMID wrappers
+    if start < 0:
+        raise ValueError('not a MIDI file (no MThd header)')
+    hlen = struct.unpack('>I', data[start + 4:start + 8])[0]
+    fmt, ntrks, division = struct.unpack('>HHH', data[start + 8:start + 14])
+    pos = start + 8 + hlen
+    tracks = []
+    while pos + 8 <= len(data):
+        cid, clen = data[pos:pos + 4], struct.unpack('>I', data[pos + 4:pos + 8])[0]
+        pos += 8
+        if cid == b'MTrk':
+            tracks.append(parse_track(data[pos:pos + clen]))
+        pos += clen
+    return fmt, division, tracks
+
+
+class TempoMap:
+    def __init__(self, division, tracks):
+        self.smpte = bool(division & 0x8000)
+        if self.smpte:
+            fps = 256 - (division >> 8)
+            self.sec_per_tick = 1.0 / (fps * (division & 0xFF))
+            return
+        self.tpq = division or 480
+        tempos = sorted((ev[0], ev[2]) for tr in tracks for ev in tr if ev[1] == 'tempo')
+        self.points = []  # (tick, seconds_at_tick, sec_per_tick)
+        tick, sec, spt = 0, 0.0, 500000 / 1e6 / self.tpq
+        for t, uspq in tempos:
+            sec += (t - tick) * spt
+            tick, spt = t, uspq / 1e6 / self.tpq
+            self.points.append((tick, sec, spt))
+        if not self.points or self.points[0][0] != 0:
+            self.points.insert(0, (0, 0.0, 500000 / 1e6 / self.tpq))
+        self._ticks = [p[0] for p in self.points]
+
+    def seconds(self, tick):
+        if self.smpte:
+            return tick * self.sec_per_tick
+        i = bisect.bisect_right(self._ticks, tick) - 1
+        t0, s0, spt = self.points[max(i, 0)]
+        return s0 + (tick - t0) * spt
+
+
+class Voice:
+    def __init__(self, vid, track, channel):
+        self.id, self.track, self.channel = vid, track, channel
+        self.name = ''
+        self.notes = []
+        self.prog = 0
+        self.score = 0.0
+        self.weight = 0.0
+        self.melody = False
+        self.muted = False
+        self.double_of = None
+        self.stats = {}
+
+    @property
+    def drums(self):
+        return self.channel == DRUM_CHANNEL
+
+    def label(self):
+        if self.drums:
+            inst = 'Drums'
+        else:
+            inst = f'{GM_FAMILIES[self.prog // 8]}({self.prog})'
+        return f'trk{self.track} ch{self.channel + 1} {inst}' + (f' "{self.name}"' if self.name else '')
+
+
+def extract_notes(path):
+    fmt, division, tracks = load_midi(path)
+    tmap = TempoMap(division, tracks)
+
+    # Program changes are per channel, not per track, so gather them globally.
+    progs = {}
+    for tr in tracks:
+        for tick, kind, ch, p, _ in tr:
+            if kind == 'prog':
+                progs.setdefault(ch, []).append((tick, p))
+    for ch in progs:
+        progs[ch].sort()
+
+    def program_at(ch, tick):
+        cur = 0
+        for t, p in progs.get(ch, ()):
+            if t > tick:
+                break
+            cur = p
+        return cur
+
+    voices = {}
+    for ti, tr in enumerate(tracks):
+        tname = next((ev[2] for ev in tr if ev[1] == 'name'), '')
+        active = {}  # (ch, pitch) -> [(start_tick, vel)]
+        end_tick = tr[-1][0]
+
+        def close(ch, pitch, start_tick, vel, tick):
+            key = (ti, ch)
+            v = voices.get(key)
+            if v is None:
+                v = voices[key] = Voice(len(voices), ti, ch)
+                v.name = tname
+            s, e = tmap.seconds(start_tick), tmap.seconds(tick)
+            if e - s > 0.001:
+                v.notes.append(Note(s, e, pitch, vel, v, program_at(ch, start_tick)))
+
+        for tick, kind, ch, pitch, vel in tr:
+            if kind == 'on':
+                stack = active.setdefault((ch, pitch), [])
+                if stack:  # re-trigger of a sounding pitch ends the old one
+                    st, sv = stack.pop(0)
+                    close(ch, pitch, st, sv, tick)
+                stack.append((tick, vel))
+            elif kind == 'off':
+                stack = active.get((ch, pitch))
+                if stack:
+                    st, sv = stack.pop(0)
+                    close(ch, pitch, st, sv, tick)
+        for (ch, pitch), stack in active.items():
+            for st, sv in stack:
+                close(ch, pitch, st, sv, max(end_tick, st + 1))
+
+    vlist = sorted(voices.values(), key=lambda v: (v.track, v.channel))
+    for i, v in enumerate(vlist):
+        v.id = i
+        v.notes.sort(key=lambda n: (n.start, n.pitch))
+        counts = {}
+        for n in v.notes:
+            counts[n.prog] = counts.get(n.prog, 0) + 1
+        v.prog = max(counts, key=counts.get) if counts else 0
+    return fmt, [v for v in vlist if v.notes]
+
+
+# --------------------------------------------------------------------------
+# Voice analysis
+# --------------------------------------------------------------------------
+
+def union_length(intervals):
+    total, cur_s, cur_e = 0.0, None, None
+    for s, e in sorted(intervals):
+        if cur_e is None or s > cur_e:
+            if cur_e is not None:
+                total += cur_e - cur_s
+            cur_s, cur_e = s, e
+        else:
+            cur_e = max(cur_e, e)
+    if cur_e is not None:
+        total += cur_e - cur_s
+    return total
+
+
+def merge_tremolo(voice, max_len=0.075, max_gap=0.012):
+    """Fold runs of very short repeated notes (tremolo, rolls) into one note.
+
+    On a beeper a 20 notes/s tremolo is just a buzz; the sustained pitch is
+    what carries the tune.
+    """
+    last = {}  # pitch -> note currently being extended
+    grown = set()
+    out = []
+    for n in voice.notes:
+        prev = last.get(n.pitch)
+        if (prev is not None and n.end - n.start <= max_len
+                and 0 <= n.start - prev.end <= max_gap
+                and (prev.end - prev.start <= max_len or id(prev) in grown)):
+            prev.end = max(prev.end, n.end)
+            grown.add(id(prev))
+            continue
+        out.append(n)
+        last[n.pitch] = n
+    voice.notes = out
+
+
+def find_doubles(voices, skip=(), max_delay=0.8, tol=0.012):
+    """Detect voices that copy another voice (unison/octave doubling, echo tracks).
+
+    Returns {duplicate_id: original_id}. The original is the voice that plays
+    first (echo tracks are delayed copies) or, for simultaneous doubling,
+    the higher-scoring one.
+    """
+    tonal = [v for v in voices if not v.drums and len(v.notes) >= 8 and v.id not in skip]
+
+    def onsets(v):
+        d = {}
+        for n in v.notes:
+            d.setdefault(n.pitch % 12, []).append(n.start)
+        return d
+
+    def matched(b, a_on, delay):
+        hits = 0
+        for n in b.notes:
+            starts = a_on.get(n.pitch % 12)
+            if starts:
+                t = n.start - delay
+                i = bisect.bisect_left(starts, t - tol)
+                if i < len(starts) and starts[i] <= t + tol:
+                    hits += 1
+        return hits / len(b.notes)
+
+    ons = {v.id: onsets(v) for v in tonal}
+    doubles = {}
+    for a in tonal:
+        for b in tonal:
+            if a is b or b.id in doubles or a.id in doubles:
+                continue
+            if not (0.8 <= len(b.notes) / len(a.notes) <= 1.25):
+                continue
+            a_on = ons[a.id]
+            # Candidate delays: most common onset differences (10 ms bins).
+            hist = {}
+            for n in b.notes[:400]:
+                starts = a_on.get(n.pitch % 12, ())
+                i = bisect.bisect_left(starts, n.start - max_delay - tol)
+                while i < len(starts) and starts[i] <= n.start + tol:
+                    k = max(0, round((n.start - starts[i]) * 100))
+                    hist[k] = hist.get(k, 0) + 1
+                    i += 1
+            cands = sorted(hist, key=hist.get, reverse=True)[:4]
+            best, best_d = 0.0, 0.0
+            for k in cands:
+                frac = matched(b, a_on, k / 100)
+                if frac > best:
+                    best, best_d = frac, k / 100
+            if best < 0.85:
+                continue
+            if best_d < 0.02 and b.score > a.score:
+                continue  # simultaneous doubling: keep the better one
+            doubles[b.id] = a.id
+    return doubles
+
+
+def analyze_voices(voices, song_len):
+    tonal = [v for v in voices if not v.drums]
+    for v in tonal:
+        notes = v.notes
+        wsum = sum(min(n.end - n.start, 1.0) for n in notes)
+        mean_pitch = sum(n.pitch * min(n.end - n.start, 1.0) for n in notes) / wsum
+        # Polyphony: share of notes that start while another note of the
+        # same voice is still clearly sounding (chords, pads, arpeggio holds).
+        # Octave doubling (same pitch class) does not count as harmony.
+        overlapped, sounding = 0, []
+        for n in notes:
+            sounding = [m for m in sounding if m.end > n.start + 0.03]
+            if any((m.pitch - n.pitch) % 12 for m in sounding):
+                overlapped += 1
+            sounding.append(n)
+        poly = overlapped / len(notes)
+        coverage = union_length([(n.start, n.end) for n in notes]) / max(song_len, 1e-6)
+        nps = len(notes) / max(song_len, 1e-6)
+        # Notes per second while actually playing: > ~10/s is a tremolo,
+        # trill or fast arpeggio figure rather than a singable line.
+        density = len(notes) / max(coverage * song_len, 1e-6)
+        # Melodies move; repeated single pitches (ostinato, pedal) do not.
+        moves = sum(1 for a, b in zip(notes, notes[1:]) if a.pitch != b.pitch)
+        motion = moves / max(len(notes) - 1, 1)
+        v.stats = dict(pitch=mean_pitch, poly=poly, coverage=coverage, nps=nps,
+                       motion=motion, density=density)
+
+    if not tonal:
+        return
+    by_pitch = sorted(tonal, key=lambda v: v.stats['pitch'])
+    for rank, v in enumerate(by_pitch):
+        v.stats['prank'] = rank / (len(by_pitch) - 1) if len(by_pitch) > 1 else 1.0
+
+    for v in tonal:
+        s = v.stats
+        score = (0.30 * s['prank']
+                 + 0.30 * (1 - s['poly'])
+                 + 0.15 * min(1.0, s['coverage'] / 0.4)
+                 + 0.10 * min(1.0, s['nps'] / 2.0)
+                 + 0.10 * s['motion'])
+        score += FAMILY_BONUS[v.prog // 8]
+        if s['pitch'] < 48:
+            score -= 0.25
+        elif s['pitch'] > 90:
+            score -= 0.10
+        if NAME_PLUS.search(v.name):
+            score += 0.20
+        if NAME_MINUS.search(v.name):
+            score -= 0.20
+        if len(v.notes) < 8:
+            score -= 0.20
+        if s['density'] > 10:
+            score -= 0.25 * min(1.0, (s['density'] - 10) / 10)
+        v.score = score
+
+
+def assign_roles(voices, melody_ids, mute_ids, margin):
+    tonal = [v for v in voices if not v.drums]
+    for v in voices:
+        v.muted = v.drums or v.id in mute_ids
+    live = [v for v in tonal if not v.muted]
+    if not live:
+        return
+    if melody_ids:
+        for v in live:
+            v.melody = v.id in melody_ids
+            v.weight = 1.0 if v.melody else max(0.0, min(0.5, v.score))
+        return
+    best = max(v.score for v in live)
+    for v in live:
+        v.weight = max(0.0, min(1.0, (v.score - (best - 0.6)) / 0.6))
+        # Chordal voices only count as melody when nothing better exists.
+        v.melody = v.score >= best - margin and (v.stats['poly'] <= 0.4 or v.score == best)
+
+
+# --------------------------------------------------------------------------
+# Projection onto a single line (Viterbi over the timeline)
+# --------------------------------------------------------------------------
+
+def local_weights(voices, song_len, forced, win=4.0, hop=1.0):
+    """Give every note a melodic weight 0..1 that reflects its surroundings.
+
+    Instruments swap roles during a song (the lead hands the tune to a sax,
+    strings go from melody to a held pad), so voices compete per ~4 s window
+    on local activity, monophony and register, with the global score as prior.
+    """
+    live = [v for v in voices if not v.muted]
+    nwin = int(song_len / hop) + 1
+    local = {}  # (voice_id, window) -> score
+    for v in live:
+        notes = v.notes
+        lo = 0
+        for k in range(nwin):
+            t0 = k * hop + hop / 2 - win / 2
+            t1 = t0 + win
+            while lo < len(notes) and notes[lo].start < t0:
+                lo += 1
+            hi = lo
+            while hi < len(notes) and notes[hi].start < t1:
+                hi += 1
+            chunk = notes[lo:hi]
+            if not chunk:
+                continue
+            onsets = len({round(n.start, 2) for n in chunk})
+            r = onsets / win
+            if r <= 1.5:
+                act = r / 1.5
+            elif r <= 10:
+                act = 1.0
+            else:
+                act = max(0.4, 1 - (r - 10) / 10)
+            over, sounding = 0, []
+            for n in chunk:
+                sounding = [m for m in sounding if m.end > n.start + 0.03]
+                if any((m.pitch - n.pitch) % 12 for m in sounding):
+                    over += 1
+                sounding.append(n)
+            poly = over / len(chunk)
+            top = sum(max(m.pitch for m in chunk if abs(m.start - n.start) < 0.03)
+                      for n in chunk) / len(chunk)
+            local[(v.id, k)] = [0.5 * act + 0.2 * (1 - poly) + 0.3 * v.score, top]
+    # Register rank inside each window.
+    by_win = {}
+    for (vid, k), val in local.items():
+        by_win.setdefault(k, []).append((vid, val))
+    rel = {}
+    for k, items in by_win.items():
+        items.sort(key=lambda it: it[1][1])
+        m = len(items)
+        for rank, (vid, val) in enumerate(items):
+            val[0] += 0.2 * (rank / (m - 1) if m > 1 else 1.0)
+        best = max(val[0] for _, val in items)
+        for vid, val in items:
+            rel[(vid, k)] = max(0.0, min(1.0, (val[0] - (best - 0.5)) / 0.5))
+    for v in live:
+        for n in v.notes:
+            w = rel.get((v.id, int(n.start / hop)), 0.0)
+            w = 0.7 * w + 0.3 * v.weight
+            if forced:
+                w = 1.0 if v.id in forced else min(w, 0.4)
+            n.w = w
+
+
+def is_melody(n):
+    return n.voice.melody or n.w >= Params.melody_w
+
+
+class Params:
+    w_voice = 4.0       # per second, for weight 1.0
+    w_melody = 1.5      # extra per second for notes with w >= melody_w
+    melody_w = 0.75     # note weight that counts as melody (not fill)
+    hold = 0.5          # seconds a note keeps full priority after its attack...
+    hold_tau = 0.5      # ...then its priority decays with this time constant...
+    hold_floor = 0.35   # ...down to this fraction
+    w_pitch = 0.6       # per second per octave above C4
+    onset = 0.25        # bonus for starting a note on its attack
+    cont = 0.10         # bonus for keeping the same note
+    resume = 0.20       # penalty for entering a note after its attack
+    switch = 0.15       # penalty for changing voice
+    jump = 0.01         # penalty per semitone beyond an octave...
+    jump_cap = 0.12     # ...capped, phrases may start anywhere
+    fill_rate = 1.0     # per second value of any accompaniment note in a gap
+    max_cands = 8
+
+
+def project(voices, fill, P):
+    notes = [n for v in voices if not v.muted for n in v.notes]
+    if fill == 'none':
+        notes = [n for n in notes if is_melody(n)]
+    if not notes:
+        return []
+    for i, n in enumerate(notes):
+        n.idx = i
+
+    def rate(n):
+        r = P.w_voice * n.w + P.w_pitch * max(-2.0, min(2.0, (n.pitch - 60) / 12))
+        if is_melody(n):
+            r += P.w_melody
+        return max(r, P.fill_rate)
+
+    def held(n, a, b):
+        # Priority of a long note fades after it has been heard for a while,
+        # so the background can speak during held melody notes.
+        age = (a + b) / 2 - n.start
+        if age <= P.hold:
+            return 1.0
+        return P.hold_floor + (1 - P.hold_floor) * math.exp(-(age - P.hold) / P.hold_tau)
+
+    rates = [rate(n) for n in notes]
+
+    # Elementary segments between every start/end (1 ms resolution).
+    bounds = sorted({round(t, 3) for n in notes for t in (n.start, n.end)})
+    starts = sorted(notes, key=lambda n: n.start)
+    si, active = 0, []
+    SIL = -1
+    prev_states, prev_scores, back = [SIL], [0.0], []
+    seg_list = []
+    for a, b in zip(bounds, bounds[1:]):
+        while si < len(starts) and round(starts[si].start, 3) <= a:
+            active.append(starts[si])
+            si += 1
+        active = [n for n in active if round(n.end, 3) > a]
+        dur = b - a
+        cands = active
+        if len(cands) > P.max_cands:
+            cands = sorted(cands, key=lambda n: rates[n.idx], reverse=True)[:P.max_cands]
+        states = [SIL] + [n.idx for n in cands]
+        scores, ptr = [], []
+        for st in states:
+            if st == SIL:
+                node, n = 0.0, None
+            else:
+                n = notes[st]
+                node = rates[st] * dur * held(n, a, b)
+                if round(n.start, 3) == a:
+                    node += P.onset * (0.3 + 0.7 * n.w)
+            best, bi = -1e18, 0
+            for j, ps in enumerate(prev_states):
+                sc = prev_scores[j]
+                if n is not None:
+                    if ps == st:  # (scaled down for sub-50 ms slivers)
+                        sc += P.cont * min(1.0, dur / 0.05)
+                    else:
+                        if round(n.start, 3) != a:
+                            sc -= P.resume
+                        if ps != SIL:
+                            pn = notes[ps]
+                            if pn.voice is not n.voice:
+                                sc -= P.switch
+                            iv = abs(pn.pitch - n.pitch)
+                            if iv > 12:
+                                sc -= min(P.jump_cap, P.jump * (iv - 12))
+                if sc > best:
+                    best, bi = sc, j
+            scores.append(best + node)
+            ptr.append(bi)
+        back.append((states, ptr, prev_states))
+        seg_list.append((a, b))
+        prev_states, prev_scores = states, scores
+
+    # Backtrack.
+    j = max(range(len(prev_scores)), key=prev_scores.__getitem__)
+    chosen = [None] * len(seg_list)
+    for k in range(len(seg_list) - 1, -1, -1):
+        states, ptr, _ = back[k]
+        chosen[k] = states[j]
+        j = ptr[j]
+
+    # Merge consecutive segments of the same note into fragments.
+    frags = []
+    for (a, b), st in zip(seg_list, chosen):
+        if st == SIL:
+            continue
+        if frags and frags[-1][2] is notes[st] and abs(frags[-1][1] - a) < 1e-9:
+            frags[-1][1] = b
+        else:
+            frags.append([a, b, notes[st]])
+    return frags
+
+
+def cleanup(frags, min_len):
+    """Absorb fragments too short to be heard as a note."""
+    out = []
+    for i, f in enumerate(frags):
+        if f[1] - f[0] >= min_len:
+            out.append(f)
+            continue
+        nxt = frags[i + 1] if i + 1 < len(frags) else None
+        if nxt is not None and abs(nxt[0] - f[1]) < 1e-6 and nxt[1] - nxt[0] >= min_len:
+            nxt[0] = f[0]  # let the next note start a hair earlier
+        elif out and abs(out[-1][1] - f[0]) < 1e-6:
+            out[-1][1] = f[1]
+        # else: isolated blip, drop it
+    # merge neighbours that ended up being the same note again
+    merged = []
+    for f in out:
+        if merged and merged[-1][2] is f[2] and abs(merged[-1][1] - f[0]) < 1e-6:
+            merged[-1][1] = f[1]
+        else:
+            merged.append(f)
+    return merged
+
+
+def to_tones(frags, voices, fill, arp_ms, gap_ms, transpose, lo, hi, speed):
+    """Fragments -> list of [start_s, end_s, midi_pitch, is_fill, voice_id]."""
+    live_notes = [n for v in voices if not v.muted for n in v.notes]
+    live_notes.sort(key=lambda n: n.start)
+
+    def fold(p):
+        p += transpose
+        while p < lo:
+            p += 12
+        while p > hi:
+            p -= 12
+        return p
+
+    tones = []
+    for a, b, n in frags:
+        is_fill = not is_melody(n)
+        if fill == 'arp' and is_fill and (b - a) >= 2 * arp_ms / 1000:
+            sounding = {m.pitch for m in live_notes
+                        if m.start <= a + 1e-3 and m.end > a + 1e-3}
+            top = max(sounding | {n.pitch})
+            chord = sorted(p for p in sounding if p >= top - 15)
+            if len(chord) >= 2:
+                step = arp_ms / 1000
+                t, k = a, 0
+                while t < b - 1e-6:
+                    tones.append([t, min(t + step, b), fold(chord[k % len(chord)]), True, n.voice.id])
+                    t += step
+                    k += 1
+                continue
+        tones.append([a, b, fold(n.pitch), is_fill, n.voice.id])
+
+    # Re-attacks of the same pitch need a small silence or beep merges them.
+    gap = gap_ms / 1000
+    for x, y in zip(tones, tones[1:]):
+        if x[2] == y[2] and y[0] - x[1] < gap:
+            x[1] = max(x[0] + (x[1] - x[0]) * 0.6, min(x[1], y[0] - gap))
+    if speed != 1.0:
+        for t in tones:
+            t[0] /= speed
+            t[1] /= speed
+    return tones
+
+
+# --------------------------------------------------------------------------
+# Output
+# --------------------------------------------------------------------------
+
+def beep_args(tones):
+    args = []
+    if not tones:
+        return args
+    t0 = tones[0][0]
+    ms = lambda t: int(round((t - t0) * 1000))
+    for i, (a, b, p, *_) in enumerate(tones):
+        length = ms(b) - ms(a)
+        if length <= 0:
+            continue
+        if args:
+            args.append('-n')
+        args += ['-f', str(int(round(midi_to_hz(p)))), '-l', str(length)]
+        if i + 1 < len(tones):
+            delay = ms(tones[i + 1][0]) - ms(b)
+            if delay > 0:
+                args += ['-D', str(delay)]
+    return args
+
+
+def write_wav(path, tones, rate=22050, amp=6000):
+    buf = array('h')
+    if not tones:
+        tones = []
+    t0 = tones[0][0] if tones else 0.0
+    pos = 0
+    for a, b, p, *_ in tones:
+        s, e = int((a - t0) * rate), int((b - t0) * rate)
+        if s > pos:
+            buf.extend([0] * (s - pos))
+        n = max(0, e - max(s, pos))
+        f2 = 2 * midi_to_hz(p) / rate
+        buf.extend([amp if int(i * f2) & 1 == 0 else -amp for i in range(n)])
+        pos = max(pos, e)
+    buf.extend([0] * (rate // 4))
+    if sys.byteorder == 'big':
+        buf.byteswap()
+    with wave.open(path, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        w.writeframes(buf.tobytes())
+
+
+def print_info(voices, song_len, fmt, file=sys.stderr):
+    print(f'format {fmt}, {len(voices)} voices, {song_len:.1f}s', file=file)
+    print(f'{"#":>3} {"role":<7} {"score":>6} {"notes":>6} {"pitch":>5} {"poly":>5} {"cover":>5}  voice', file=file)
+    for v in voices:
+        if v.drums:
+            role = 'drums'
+        elif v.double_of is not None:
+            role = f'=#{v.double_of}'
+        elif v.muted:
+            role = 'muted'
+        else:
+            role = 'MELODY' if v.melody else 'backgr'
+        s = v.stats
+        if s:
+            print(f'{v.id:>3} {role:<7} {v.score:6.2f} {len(v.notes):6d} {note_name(round(s["pitch"])):>5} '
+                  f'{s["poly"]:5.2f} {s["coverage"]:5.2f}  {v.label()}', file=file)
+        else:
+            print(f'{v.id:>3} {role:<7} {"":>6} {len(v.notes):6d} {"":>5} {"":>5} {"":>5}  {v.label()}', file=file)
+
+
+def parse_ids(s):
+    out = set()
+    for part in (s or '').replace(' ', '').split(','):
+        if not part:
+            continue
+        if '-' in part:
+            a, b = part.split('-', 1)
+            out.update(range(int(a), int(b) + 1))
+        else:
+            out.add(int(part))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description='Convert a multi-channel MIDI file into a melody-first single-voice beep sequence.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='examples:\n'
+               '  midibeep song.mid --play            # analyse and play on the PC speaker\n'
+               '  midibeep song.mid --info            # show how voices were rated\n'
+               '  midibeep song.mid --melody 2,5 -p   # force voices #2 and #5 as melody\n'
+               '  midibeep song.mid --fill arp -p     # chords in melody gaps as arpeggios\n'
+               '  midibeep song.mid --wav test.wav    # preview without the speaker\n'
+               '  midibeep song.mid -o song.sh        # save a runnable beep script\n')
+    ap.add_argument('midi')
+    ap.add_argument('-p', '--play', action='store_true', help='play through `beep`')
+    ap.add_argument('-o', '--output', metavar='FILE', help='write a runnable shell script with the beep command')
+    ap.add_argument('-w', '--wav', metavar='FILE', help='render a square-wave WAV preview')
+    ap.add_argument('-i', '--info', action='store_true', help='print the voice analysis')
+    ap.add_argument('-d', '--dump', action='store_true', help='print the resulting note sequence')
+    ap.add_argument('-q', '--quiet', action='store_true', help='do not print the beep command')
+    ap.add_argument('-m', '--melody', metavar='IDS', help='voice numbers (from --info) to treat as melody, e.g. 1,3-4')
+    ap.add_argument('-x', '--mute', metavar='IDS', help='voice numbers to ignore completely')
+    ap.add_argument('-f', '--fill', choices=['notes', 'arp', 'none'], default='notes',
+                    help='what plays when the melody rests: best background note (default), '
+                         'arpeggiated chord, or silence')
+    ap.add_argument('--arp-ms', type=float, default=35, help='arpeggio step in ms (default 35)')
+    ap.add_argument('--margin', type=float, default=0.2,
+                    help='voices scoring within this of the best are melody (default 0.2)')
+    ap.add_argument('-s', '--speed', type=float, default=1.0, help='tempo multiplier, 2 = twice as fast')
+    ap.add_argument('-t', '--transpose', type=int, default=0, help='semitones')
+    ap.add_argument('--lowest', type=int, default=45,
+                    help='fold notes below this MIDI pitch up by octaves (default 45 = A2, 110 Hz)')
+    ap.add_argument('--highest', type=int, default=100,
+                    help='fold notes above this MIDI pitch down (default 100 = E7)')
+    ap.add_argument('--min-note', type=float, default=30, help='shortest tone kept, ms (default 30)')
+    ap.add_argument('--gap', type=float, default=15, help='silence between repeated pitches, ms (default 15)')
+    ap.add_argument('--sustain', type=float, metavar='MS',
+                    help='how long a held note keeps full priority before background may '
+                         'take over (default 500; large value = never)')
+    ap.add_argument('--keep-tremolo', action='store_true', help='do not merge tremolo/repeated 32nds into long notes')
+    ap.add_argument('--keep-doubles', action='store_true', help='do not drop voices that duplicate/echo another voice')
+    ap.add_argument('--start', type=float, default=0, help='start at this second of the song')
+    ap.add_argument('--length', type=float, default=0, help='only this many seconds')
+    args = ap.parse_args()
+    if args.highest - args.lowest < 11:
+        ap.error('--highest must be at least 11 semitones above --lowest')
+    if args.speed <= 0:
+        ap.error('--speed must be positive')
+
+    try:
+        fmt, voices = extract_notes(args.midi)
+    except (OSError, ValueError, struct.error) as e:
+        sys.exit(f'midibeep: {args.midi}: {e}')
+    if not voices:
+        sys.exit('midibeep: no notes found')
+
+    song_len = max(n.end for v in voices for n in v.notes)
+    if not args.keep_tremolo:
+        for v in voices:
+            merge_tremolo(v)
+    analyze_voices(voices, song_len)
+    known = {v.id for v in voices}
+    melody_ids, mute_ids = parse_ids(args.melody), parse_ids(args.mute)
+    for i in (melody_ids | mute_ids) - known:
+        sys.exit(f'midibeep: no voice #{i} (see --info)')
+    if not args.keep_doubles:
+        for dup, orig in find_doubles(voices, skip=mute_ids).items():
+            if dup not in melody_ids:
+                voices[dup].double_of = orig
+                mute_ids.add(dup)
+    assign_roles(voices, melody_ids, mute_ids, args.margin)
+    local_weights(voices, song_len, melody_ids)
+    if args.sustain is not None:
+        Params.hold = args.sustain / 1000
+    if args.info:
+        print_info(voices, song_len, fmt)
+
+    if args.start or args.length:
+        lo_t = args.start
+        hi_t = args.start + args.length if args.length else float('inf')
+        for v in voices:
+            v.notes = [n for n in v.notes if n.end > lo_t and n.start < hi_t]
+            for n in v.notes:
+                n.start, n.end = max(n.start, lo_t), min(n.end, hi_t)
+
+    frags = project(voices, args.fill, Params)
+    frags = cleanup(frags, args.min_note / 1000)
+    tones = to_tones(frags, voices, args.fill, args.arp_ms, args.gap,
+                     args.transpose, args.lowest, args.highest, args.speed)
+    if not tones:
+        sys.exit('midibeep: nothing to play')
+
+    if args.dump:
+        for a, b, p, is_fill, vid in tones:
+            print(f'{a:8.3f} {int((b - a) * 1000):5d}ms {note_name(p):>4}  #{vid:<3}{" fill" if is_fill else ""}',
+                  file=sys.stderr)
+
+    bargs = beep_args(tones)
+    cmd = 'beep ' + ' '.join(shlex.quote(a) for a in bargs)
+    if args.output:
+        with open(args.output, 'w') as f:
+            f.write('#!/bin/sh\n# generated by midibeep from ' + os.path.basename(args.midi) + '\n')
+            f.write('exec ' + cmd + '\n')
+        if os.path.isfile(args.output):
+            os.chmod(args.output, 0o755)
+    if args.wav:
+        write_wav(args.wav, tones)
+    if not (args.quiet or args.play or args.output or args.wav or args.info or args.dump):
+        print(cmd)
+    if args.play:
+        total = tones[-1][1] - tones[0][0]
+        print(f'playing {len(tones)} tones, {total:.0f}s ... (Ctrl+C to stop)', file=sys.stderr)
+        try:
+            sys.exit(subprocess.call(['beep'] + bargs))
+        except KeyboardInterrupt:
+            sys.exit(130)
+        except FileNotFoundError:
+            sys.exit('midibeep: `beep` not found')
+
+
+if __name__ == '__main__':
+    main()
