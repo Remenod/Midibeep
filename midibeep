@@ -775,6 +775,17 @@ def parse_ids(s):
     return out
 
 
+def seconds_arg(text):
+    """Non-negative seconds; accepts a decimal comma too (2,5 == 2.5)."""
+    try:
+        value = float(text.strip().replace(',', '.'))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'not a number of seconds: {text!r}')
+    if value < 0 or math.isnan(value) or math.isinf(value):
+        raise argparse.ArgumentTypeError(f'must be a non-negative number of seconds: {text!r}')
+    return value
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Convert a multi-channel MIDI file into a melody-first single-voice beep sequence.',
@@ -785,7 +796,8 @@ def main():
                '  midibeep song.mid --melody 2,5 -p   # force voices #2 and #5 as melody\n'
                '  midibeep song.mid --fill arp -p     # chords in melody gaps as arpeggios\n'
                '  midibeep song.mid --wav test.wav    # preview without the speaker\n'
-               '  midibeep song.mid -o song.sh        # save a runnable beep script\n')
+               '  midibeep song.mid -o song.sh        # save a runnable beep script\n'
+               '  midibeep song.mid -S 12.5 -p        # skip the first 12.5 s of the song\n')
     ap.add_argument('midi')
     ap.add_argument('-p', '--play', action='store_true', help='play through `beep`')
     ap.add_argument('-o', '--output', metavar='FILE', help='write a runnable shell script with the beep command')
@@ -814,8 +826,11 @@ def main():
                          'take over (default 500; large value = never)')
     ap.add_argument('--keep-tremolo', action='store_true', help='do not merge tremolo/repeated 32nds into long notes')
     ap.add_argument('--keep-doubles', action='store_true', help='do not drop voices that duplicate/echo another voice')
-    ap.add_argument('--start', type=float, default=0, help='start at this second of the song')
-    ap.add_argument('--length', type=float, default=0, help='only this many seconds')
+    ap.add_argument('-S', '--skip', '--start', dest='skip', type=seconds_arg, default=0, metavar='SEC',
+                    help='skip this many seconds from the start of the MIDI file, fractions '
+                         'allowed (2.5 or 2,5); counted in song time, before --speed')
+    ap.add_argument('--length', type=seconds_arg, default=0, metavar='SEC',
+                    help='only this many seconds after the skip point')
     args = ap.parse_args()
     if args.highest - args.lowest < 11:
         ap.error('--highest must be at least 11 semitones above --lowest')
@@ -850,9 +865,11 @@ def main():
     if args.info:
         print_info(voices, song_len, fmt)
 
-    if args.start or args.length:
-        lo_t = args.start
-        hi_t = args.start + args.length if args.length else float('inf')
+    if args.skip >= song_len:
+        sys.exit(f'midibeep: --skip {args.skip:g}s is past the end of the song ({song_len:.1f}s)')
+    if args.skip or args.length:
+        lo_t = args.skip
+        hi_t = args.skip + args.length if args.length else float('inf')
         for v in voices:
             v.notes = [n for n in v.notes if n.end > lo_t and n.start < hi_t]
             for n in v.notes:
